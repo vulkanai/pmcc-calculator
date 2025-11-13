@@ -1,0 +1,226 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>PMCC Calculator — Dark (Weeklies ≤8d)</title>
+<style>
+  :root{
+    --bg:#0b0f14;--card:#0f1720;--muted:#9aa7b2;--accent:#4f46e5;--ok:#10b981;--warn:#fb7185;
+    --surface:#0b1220;--text:#e6eef6;
+  }
+  html,body{height:100%;margin:0;background:linear-gradient(180deg,#061018 0%, #081122 100%);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Arial;}
+  .wrap{max-width:720px;margin:18px auto;padding:18px;}
+  h1{margin:0;font-size:20px}
+  p.lead{color:var(--muted);margin:6px 0 12px;font-size:13px}
+  label{display:block;margin-top:12px;font-size:13px;color:var(--muted)}
+  input,select,button{width:100%;box-sizing:border-box;padding:12px;border-radius:10px;border:1px solid rgba(255,255,255,0.04);background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));color:var(--text);font-size:15px}
+  .row{display:flex;gap:10px}
+  .col{flex:1}
+  button{background:var(--accent);border:none;color:white;font-weight:700;margin-top:14px}
+  .output{margin-top:16px;padding:14px;border-radius:12px;background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.03)}
+  .muted{color:var(--muted);font-size:13px}
+  .ok{color:var(--ok);font-weight:700}
+  .warn{color:var(--warn);font-weight:700}
+  .small{font-size:13px;color:var(--muted)}
+  @media(max-width:560px){
+    .row{flex-direction:column}
+    input,button{padding:14px;border-radius:12px}
+    h1{font-size:18px}
+  }
+  .footer{margin-top:14px;font-size:12px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>PMCC Calculator (Weeklies ≤8 days)</h1>
+  <p class="lead">Minimal summary output. Enter LEAPS info and delta range; the tool finds one recommended weekly short strike that meets your safety rules. Works best hosted (GitHub Pages).</p>
+
+  <label>Ticker</label>
+  <input id="ticker" value="IWM" autocomplete="off"/>
+
+  <div class="row">
+    <div class="col">
+      <label>LEAPS Strike ($)</label>
+      <input id="leapsStrike" type="number" step="0.01" value="205"/>
+    </div>
+    <div class="col">
+      <label>LEAPS Cost per share ($)</label>
+      <input id="leapsCost" type="number" step="0.01" value="53.30"/>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col">
+      <label>Delta min (manual)</label>
+      <input id="deltaMin" type="number" step="0.01" value="0.20"/>
+    </div>
+    <div class="col">
+      <label>Delta max (manual)</label>
+      <input id="deltaMax" type="number" step="0.01" value="0.25"/>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col">
+      <label>Risk-free rate (annual %)</label>
+      <input id="r" type="number" step="0.01" value="3.5"/>
+    </div>
+    <div class="col">
+      <label>Max expiry days (weeklies) — fixed to 8</label>
+      <input id="maxDays" type="number" value="8" disabled/>
+    </div>
+  </div>
+
+  <button id="go">Get Recommendation</button>
+
+  <div class="output" id="output" aria-live="polite">
+    <div class="small">Results will appear after clicking <strong>Get Recommendation</strong>. If hosted on GitHub Pages this will fetch live data reliably.</div>
+  </div>
+
+  <div class="footer">Prepared for GitHub Pages: https://vulkanai.github.io/pmcc-calculator/</div>
+</div>
+
+<script>
+/* Math helpers */
+function normCdf(x){
+  var t = 1/(1+0.2316419*Math.abs(x));
+  var d = 0.3989423*Math.exp(-x*x/2);
+  var prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+  return x>0 ? 1-prob : prob;
+}
+function bsCallInfo(S,K,r,sigma,T){
+  if(T<=0) return {price: Math.max(0,S-K), delta: S>K?1:0};
+  var sqrtT=Math.sqrt(T);
+  var d1=(Math.log(S/K)+(r+0.5*sigma*sigma)*T)/(sigma*sqrtT);
+  var d2=d1 - sigma*sqrtT;
+  var price = S*normCdf(d1) - K*Math.exp(-r*T)*normCdf(d2);
+  var delta = normCdf(d1);
+  return {price:price, delta:delta};
+}
+function fmt(n){ return (typeof n==='number')? n.toFixed(2) : n; }
+
+/* main */
+document.getElementById('go').addEventListener('click', async function(){
+  const out = document.getElementById('output');
+  out.innerHTML = '<div class="small">Fetching option chain (via proxy)…</div>';
+  try{
+    const ticker = document.getElementById('ticker').value.trim().toUpperCase();
+    const leapsStrike = parseFloat(document.getElementById('leapsStrike').value);
+    const leapsCost = parseFloat(document.getElementById('leapsCost').value);
+    const deltaMin = parseFloat(document.getElementById('deltaMin').value);
+    const deltaMax = parseFloat(document.getElementById('deltaMax').value);
+    const r = parseFloat(document.getElementById('r').value)/100;
+    const maxDays = parseFloat(document.getElementById('maxDays').value);
+
+    if(!ticker) throw new Error('Enter ticker');
+    if(!(leapsStrike>0) || !(leapsCost>=0)) throw new Error('Enter LEAPS strike and cost');
+
+    // Yahoo endpoint
+    const yahooTop = 'https://query2.finance.yahoo.com/v7/finance/options/' + encodeURIComponent(ticker);
+    // use AllOrigins proxy to bypass CORS when hosted (AllOrigins supports https)
+    const proxy = 'https://api.allorigins.win/raw?url=';
+    const topResp = await fetch(proxy + encodeURIComponent(yahooTop));
+    if(!topResp.ok) throw new Error('Failed to fetch top options (Yahoo) via proxy');
+    const topJson = await topResp.json();
+    if(!topJson.optionChain || !topJson.optionChain.result || topJson.optionChain.result.length===0) throw new Error('No option chain data');
+
+    const result0 = topJson.optionChain.result[0];
+    const underlyingPrice = result0.quote && result0.quote.regularMarketPrice ? result0.quote.regularMarketPrice : null;
+    const expirations = result0.expirationDates;
+    if(!underlyingPrice) throw new Error('No underlying price from Yahoo');
+
+    // choose nearest expiry within maxDays
+    const now = Date.now();
+    let chosenExp = null, bestDays = 1e9;
+    for(const e of expirations){
+      const days = (e*1000 - now)/(1000*3600*24);
+      if(days >= 0 && days <= maxDays && days < bestDays){
+        bestDays = days; chosenExp = e;
+      }
+    }
+    if(!chosenExp) throw new Error('No weekly expiry (≤ ' + maxDays + 'd) found');
+
+    // fetch chain for chosen expiry
+    const chainUrl = 'https://query2.finance.yahoo.com/v7/finance/options/' + encodeURIComponent(ticker) + '?date=' + chosenExp;
+    const chainResp = await fetch(proxy + encodeURIComponent(chainUrl));
+    if(!chainResp.ok) throw new Error('Failed to fetch option chain for expiry via proxy');
+    const chainJson = await chainResp.json();
+    const chainRes = chainJson.optionChain.result[0];
+    const expiryMs = chosenExp*1000;
+    const daysToExp = Math.max(0, Math.round((expiryMs - now)/(1000*3600*24)));
+    const T = Math.max(0, (expiryMs - now)/(1000*3600*24*365));
+
+    // extract calls
+    if(!chainRes.options || chainRes.options.length===0 || !chainRes.options[0].calls) throw new Error('No calls for chosen expiry');
+    const callsRaw = chainRes.options[0].calls;
+
+    // compute ATM-ish IV fallback
+    const ivs = callsRaw.filter(c=>c.impliedVolatility && c.impliedVolatility>0).map(c=>c.impliedVolatility);
+    const atmIv = ivs.length ? ivs[Math.floor(ivs.length/2)] : 0.30;
+
+    // build candidates meeting safety rules and > leaps breakeven
+    const leapsBreakeven = leapsStrike + leapsCost;
+    let candidates = [];
+    for(const c of callsRaw){
+      const strike = c.strike;
+      if(strike <= leapsBreakeven) continue;
+      if((strike - leapsStrike) <= leapsCost) continue; // safety width fail
+      const vol = (c.impliedVolatility && c.impliedVolatility>0) ? c.impliedVolatility : atmIv;
+      const info = bsCallInfo(underlyingPrice, strike, r, vol, T);
+      const delta = info.delta;
+      const premium = (c.bid && c.ask) ? (c.bid + c.ask)/2 : (c.lastPrice || info.price);
+      candidates.push({strike, delta, premium, vol});
+    }
+
+    // filter by manual delta range
+    const filtered = candidates.filter(x => x.delta >= deltaMin && x.delta <= deltaMax);
+    filtered.sort((a,b)=>a.strike - b.strike);
+    const chosen = filtered.length ? filtered[0] : null;
+    let fallback = null;
+    if(!chosen && candidates.length) fallback = candidates.sort((a,b)=>a.strike - b.strike)[0];
+
+    // compose output
+    let html = '';
+    html += '<div class="small">Ticker: ' + ticker + ' — underlying last: $' + fmt(underlyingPrice) + '</div>';
+    html += '<div class="small">Chosen expiry (weekly ≤ ' + maxDays + ' days): ' + new Date(expiryMs).toDateString() + ' (' + daysToExp + ' days)</div>';
+    html += '<hr style="border-color:rgba(255,255,255,0.03)">';
+    html += '<div class="small"><strong>LEAPS strike:</strong> $' + fmt(leapsStrike) + ' &nbsp; <strong>LEAPS cost:</strong> $' + fmt(leapsCost) + '</div>';
+    html += '<div class="small"><strong>LEAPS breakeven (strike + cost):</strong> $' + fmt(leapsBreakeven) + '</div>';
+    html += '<hr style="border-color:rgba(255,255,255,0.03)">';
+    if(chosen){
+      const spreadWidth = chosen.strike - leapsStrike;
+      const spreadValue = spreadWidth * 100;
+      const leapsCostTotal = leapsCost * 100;
+      const safe = spreadWidth > leapsCost;
+      const netIfAssigned = spreadValue - leapsCostTotal + (chosen.premium*100);
+      const pmccBreakeven = leapsStrike + (leapsCost - chosen.premium);
+      html += '<h3 style="margin:6px 0 8px">Recommended Short Strike: $' + fmt(chosen.strike) + '</h3>';
+      html += '<div class="small"><strong>Estimated premium (mid/last):</strong> $' + fmt(chosen.premium) + ' per share ($' + Math.round(chosen.premium*100) + '/contract)</div>';
+      html += '<div class="small"><strong>Estimated delta (BS):</strong> ' + chosen.delta.toFixed(3) + '</div>';
+      html += '<div class="small"><strong>Spread width:</strong> $' + fmt(spreadWidth) + '  → $' + fmt(spreadValue) + ' per contract</div>';
+      html += '<div class="small"><strong>LEAPS cost total:</strong> $' + fmt(leapsCostTotal) + '</div>';
+      html += '<div class="small"><strong>Safety rule:</strong> ' + (safe ? '<span class="ok">SAFE</span>' : '<span class="warn">UNSAFE</span>') + '</div>';
+      html += '<div class="small"><strong>Net if forced assigned (approx):</strong> $' + fmt(netIfAssigned) + '</div>';
+      html += '<div class="small"><strong>PMCC breakeven (LEAPS strike + (LEAPS cost − premium)):</strong> $' + fmt(pmccBreakeven) + '</div>';
+      html += '<hr style="border-color:rgba(255,255,255,0.03)">';
+      html += '<div class="small muted">Note: Uses Yahoo implied vol when present; if missing a fallback IV is used. Confirm live quotes (bid/ask) before trading.</div>';
+    } else if(fallback){
+      html += '<div class="warn"><strong>No strike met all rules including your delta range.</strong></div>';
+      html += '<div class="small">Best strike that met safety (ignoring delta): $' + fmt(fallback.strike) + ' — estimated delta ' + (fallback.delta?fallback.delta.toFixed(3):'n/a') + '</div>';
+      html += '<div class="small muted">Adjust delta range or LEAPS cost to find a match.</div>';
+    } else {
+      html += '<div class="warn"><strong>No candidate strikes found that satisfy the safety rules within ' + maxDays + ' days.</strong></div>';
+      html += '<div class="small muted">You can raise maxDays, reduce LEAPS cost, or choose a later expiry.</div>';
+    }
+
+    out.innerHTML = html;
+
+  }catch(err){
+    out.innerHTML = '<div class="warn">Error: ' + (err && err.message ? err.message : err) + '</div><div class="small muted">If hosted on GitHub Pages this should fetch reliably. Local file may still be blocked by browser security.</div>';
+    console.error(err);
+  }
+});
+</script>
+</body>
+</html>
